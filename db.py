@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import time
 from contextlib import contextmanager
@@ -22,7 +23,7 @@ import pandas as pd
 import streamlit as st
 
 ROOT = Path(__file__).resolve().parent
-DB_PATH = ROOT / "logs.duckdb"
+DB_PATH = Path(os.environ.get("LOGLENS_DB", ROOT / "logs.duckdb"))   # override for a second copy
 SCHEMA_PATH = ROOT / "schema.sql"
 QUERIES_PATH = ROOT / "queries.sql"
 SAMPLE_DIR = ROOT / "sample_logs"
@@ -144,14 +145,10 @@ def ingest_file(con: duckdb.DuckDBPyConnection, path: Path | str, name: str | No
     try:
         with transaction(con):
             file_id = one(con, "insert_log_file", {"name": name})[0]
-            con.execute(QUERIES["stage_raw_lines"], {"path": str(path)})
-            line_count = con.execute("SELECT count(*) FROM raw_lines").fetchone()[0]
-            parsed = con.execute(QUERIES["ingest_requests"], {"file_id": file_id}).fetchone()[0]
-            failed = con.execute(QUERIES["ingest_parse_errors"], {"file_id": file_id}).fetchone()[0]
+            line_count, parsed, failed = _parse_into(con, file_id, path, line_offset=0)
             seconds = time.perf_counter() - t0
             con.execute(QUERIES["finish_log_file"], {"file_id": file_id, "line_count": line_count,
                                                      "parsed": parsed, "failed": failed, "seconds": seconds})
-            con.execute("DROP TABLE raw_lines")
     except duckdb.ConstraintException as e:
         if "Duplicate key" in str(e) and "name" in str(e):
             raise ValueError(f"'{name}' is already loaded. Delete it first to load it again.") from e
@@ -159,6 +156,40 @@ def ingest_file(con: duckdb.DuckDBPyConnection, path: Path | str, name: str | No
     except duckdb.Error as e:
         raise ValueError(f"Could not read '{name}': {_friendly(e)}") from e
     return IngestResult(file_id, name, line_count, parsed, failed, time.perf_counter() - t0)
+
+
+def _parse_into(con, file_id: int, path: Path | str, line_offset: int) -> tuple[int, int, int]:
+    """The shared parsing pipeline: stage the raw lines, then one INSERT ...
+    SELECT for the good lines and one for the rest. Runs inside the caller's
+    transaction; returns (lines, parsed, failed)."""
+    con.execute(QUERIES["stage_raw_lines"], {"path": str(path), "line_offset": line_offset})
+    line_count = con.execute("SELECT count(*) FROM raw_lines").fetchone()[0]
+    parsed = con.execute(QUERIES["ingest_requests"], {"file_id": file_id}).fetchone()[0]
+    failed = con.execute(QUERIES["ingest_parse_errors"], {"file_id": file_id}).fetchone()[0]
+    con.execute("DROP TABLE raw_lines")
+    return line_count, parsed, failed
+
+
+def ensure_log_file(con, name: str) -> int:
+    """Id of the log_files row called `name`, creating it if needed (live feed)."""
+    row = con.execute("SELECT id FROM log_files WHERE name = $name AND status = 'active'",
+                      {"name": name}).fetchone()
+    return row[0] if row else one(con, "insert_log_file", {"name": name})[0]
+
+
+def append_lines(con, file_id: int, path: Path | str) -> tuple[int, int, int]:
+    """Append a batch of lines to an existing log file record, through the same
+    parsing pipeline as an upload, in one transaction."""
+    t0 = time.perf_counter()
+    with transaction(con):
+        offset = con.execute("SELECT line_count FROM log_files WHERE id = $id", {"id": file_id}).fetchone()
+        if offset is None:
+            raise ValueError(f"log file {file_id} no longer exists")
+        counts = _parse_into(con, file_id, path, line_offset=offset[0])
+        con.execute(QUERIES["append_log_file_counts"],
+                    {"file_id": file_id, "line_count": counts[0], "parsed": counts[1], "failed": counts[2],
+                     "seconds": time.perf_counter() - t0})
+    return counts
 
 
 def delete_log_file(con: duckdb.DuckDBPyConnection, file_id: int) -> None:
@@ -325,16 +356,20 @@ def run_alert_check(con) -> list[dict]:
     rules = con.execute("SELECT id, name, metric, threshold, window_minutes, auto_watchlist "
                         "FROM alert_rules WHERE enabled ORDER BY id").fetchall()
     report = []
-    with transaction(con):
-        for rule_id, name, metric, threshold, window, auto in rules:
-            t0 = time.perf_counter()
-            params = {"rule_id": rule_id, "threshold": threshold, "window": window}
-            new = con.execute(alert_insert_sql(metric), params).fetchall()
-            added = _auto_watchlist(con, name, new) if auto and metric in IP_METRICS else []
-            report.append({"rule": name, "metric": metric, "new_alerts": len(new),
-                           "subjects": ", ".join(sorted({s for s, _ in new})[:8]),
-                           "auto_watchlisted": ", ".join(added),
-                           "ms": round((time.perf_counter() - t0) * 1000, 1)})
+    try:
+        with transaction(con):
+            for rule_id, name, metric, threshold, window, auto in rules:
+                t0 = time.perf_counter()
+                params = {"rule_id": rule_id, "threshold": threshold, "window": window}
+                new = con.execute(alert_insert_sql(metric), params).fetchall()
+                added = _auto_watchlist(con, name, new) if auto and metric in IP_METRICS else []
+                report.append({"rule": name, "metric": metric, "new_alerts": len(new),
+                               "subjects": ", ".join(sorted({s for s, _ in new})[:8]),
+                               "auto_watchlisted": ", ".join(added),
+                               "ms": round((time.perf_counter() - t0) * 1000, 1)})
+    except duckdb.TransactionException as e:
+        # Optimistic concurrency: the live feed's own check wrote the same rows first.
+        raise ValueError("Another alert check was writing at the same moment. Try again.") from e
     return report
 
 

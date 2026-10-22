@@ -21,11 +21,12 @@ INSERT INTO log_files (name) VALUES ($name) RETURNING id;
 -- name: stage_raw_lines
 -- Read the whole file as ONE VARCHAR column: the delimiter is the ASCII
 -- unit separator (never present in logs) and quoting is switched off, so
--- every physical line arrives verbatim. row_number() keeps line numbers.
+-- every physical line arrives verbatim. row_number() keeps line numbers;
+-- $line_offset continues the numbering when the live feed appends a batch.
 CREATE OR REPLACE TEMP TABLE raw_lines AS
 SELECT line_no, rtrim(line, chr(13)) AS line
 FROM (
-    SELECT row_number() OVER () AS line_no, line
+    SELECT row_number() OVER () + $line_offset AS line_no, line
     FROM read_csv($path,
                   columns = {'line': 'VARCHAR'},
                   header = false, delim = chr(31), quote = '', escape = '',
@@ -71,6 +72,15 @@ WHERE f.ip = ''
 UPDATE log_files
 SET line_count = $line_count, parsed_count = $parsed, failed_count = $failed,
     parse_seconds = $seconds
+WHERE id = $file_id;
+
+-- name: append_log_file_counts
+-- Live feed: each appended batch adds to the running totals.
+UPDATE log_files
+SET line_count    = line_count + $line_count,
+    parsed_count  = parsed_count + $parsed,
+    failed_count  = failed_count + $failed,
+    parse_seconds = coalesce(parse_seconds, 0) + $seconds
 WHERE id = $file_id;
 
 
@@ -204,6 +214,36 @@ SELECT isodow(ts)                                    AS dow,
 FROM requests_between($start, $end)
 GROUP BY ALL
 ORDER BY dow, hour;
+
+-- name: recent_kpis
+-- Live view: activity since $since (the last few minutes), shown as KPI deltas.
+SELECT count(*)                                                          AS requests,
+       count(DISTINCT ip)                                                AS unique_ips,
+       round(100.0 * count(*) FILTER (WHERE status >= 400) / nullif(count(*), 0), 2) AS error_rate_pct,
+       coalesce(sum(bytes), 0)                                           AS bytes
+FROM requests
+WHERE ts >= $since;
+
+-- name: live_last_hour
+-- Live view: requests per minute over the last hour, gap-filled so the
+-- chart scrolls smoothly even through silent minutes.
+WITH minutes AS (
+    SELECT unnest(range(date_trunc('minute', CAST($since AS TIMESTAMP)),
+                        date_trunc('minute', CAST($now AS TIMESTAMP)) + INTERVAL 1 MINUTE,
+                        INTERVAL 1 MINUTE)) AS minute
+),
+hits AS (
+    SELECT date_trunc('minute', ts)                     AS minute,
+           count(*) FILTER (WHERE status < 400)         AS ok,
+           count(*) FILTER (WHERE status >= 400)        AS errors
+    FROM requests
+    WHERE ts >= $since
+    GROUP BY ALL
+)
+SELECT m.minute, coalesce(h.ok, 0) AS ok, coalesce(h.errors, 0) AS errors
+FROM minutes m
+LEFT JOIN hits h USING (minute)
+ORDER BY m.minute;
 
 -- name: busiest_hour_per_day
 -- QUALIFY filters on a window function, like HAVING does for aggregates:

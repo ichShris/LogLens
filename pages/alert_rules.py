@@ -2,6 +2,7 @@ import pandas as pd
 import streamlit as st
 
 import db
+import live
 import ui
 
 con = db.cursor()
@@ -29,7 +30,10 @@ st.subheader("Run alert check")
 run_col, clear_col, _ = st.columns([1, 1, 3])
 if run_col.button("Run alert check", type="primary", icon=":material/play_arrow:"):
     with st.spinner("Evaluating enabled rules ..."):
-        st.session_state["alert_report"] = db.run_alert_check(con)
+        try:
+            st.session_state["alert_report"] = db.run_alert_check(con)
+        except ValueError as e:
+            st.warning(str(e))
 if clear_col.button("Clear all alerts", icon=":material/delete_sweep:"):
     db.clear_alerts(con)
     st.session_state.pop("alert_report", None)
@@ -53,22 +57,30 @@ with st.expander("Show SQL: alert evaluation (one INSERT per metric)", icon=":ma
         st.code(db.alert_insert_sql(metric), language="sql")
 
 # --- Alerts ------------------------------------------------------------------------------------
-st.subheader("Alerts")
 rule_names = dict(zip(rules["name"], rules["id"]))
-pick = st.selectbox("Rule", ["All rules", *rule_names])
-params = {"rule_id": None if pick == "All rules" else int(rule_names[pick])}
-alerts = ui.report(con, "alerts_list", params)
-if alerts.empty:
-    st.info("No alerts yet. Press **Run alert check**.")
-else:
-    st.dataframe(alerts, hide_index=True, column_config={
-        "id": st.column_config.NumberColumn("ID", width="small"),
-        "observed_value": st.column_config.NumberColumn("Peak value", format="%.1f"),
-        "triggered_at": st.column_config.DatetimeColumn("Triggered", format="YYYY-MM-DD HH:mm"),
-        "ended_at": st.column_config.DatetimeColumn("Ended", format="YYYY-MM-DD HH:mm"),
-        "watchlist_severity": st.column_config.TextColumn("Watchlist"),
-    })
-ui.show_sql("alerts_list", params, alerts)
+
+
+@st.fragment(run_every=live.refresh_every())   # new alerts appear while live traffic runs
+def alerts_section() -> None:
+    con = db.cursor()
+    st.subheader("Alerts")
+    pick = st.selectbox("Rule", ["All rules", *rule_names])
+    params = {"rule_id": None if pick == "All rules" else int(rule_names[pick])}
+    alerts = ui.report(con, "alerts_list", params)
+    if alerts.empty:
+        st.info("No alerts yet. Press **Run alert check**.")
+    else:
+        st.dataframe(alerts, hide_index=True, column_config={
+            "id": st.column_config.NumberColumn("ID", width="small"),
+            "observed_value": st.column_config.NumberColumn("Peak value", format="%.1f"),
+            "triggered_at": st.column_config.DatetimeColumn("Triggered", format="YYYY-MM-DD HH:mm"),
+            "ended_at": st.column_config.DatetimeColumn("Ended", format="YYYY-MM-DD HH:mm"),
+            "watchlist_severity": st.column_config.TextColumn("Watchlist"),
+        })
+    ui.show_sql("alerts_list", params, alerts)
+
+
+alerts_section()
 
 st.divider()
 create_col, edit_col = st.columns(2, gap="large")
