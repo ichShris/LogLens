@@ -1,0 +1,6 @@
+[server]
+# The 7-day sample log is ~115 MB.
+maxUploadSize = 1024
+
+[browser]
+gatherUsageStats = false

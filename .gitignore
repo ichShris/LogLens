@@ -1,0 +1,7 @@
+.venv/
+.claude/
+__pycache__/
+*.duckdb
+*.duckdb.wal
+# Regenerate with: python scripts/generate_logs.py
+sample_logs/*.log
